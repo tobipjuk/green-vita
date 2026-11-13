@@ -17,7 +17,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/vita-rust/vitasdk-rs:latest
+      # pinned: the digest :latest had on 2026-11-13 (read from the registry API, #282)
+      image: ghcr.io/vita-rust/vitasdk-rs@sha256:351f167c6c0c502baf92502b779cc4b52e9f82ac83efd172911c3ce37b3199cc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +45,8 @@ jobs:
             exit 1
           fi
 
-          echo "version=v$version" >> "$GITHUB_OUTPUT"
+          # "-lite": this fork's lighter-stream build, never mistaken for a stock release (title id unchanged)
+          echo "version=v$version-lite" >> "$GITHUB_OUTPUT"
 
       - name: Check whether release exists
         if: github.event_name != 'workflow_dispatch'

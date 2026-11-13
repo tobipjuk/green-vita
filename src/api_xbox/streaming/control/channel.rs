@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::api::streaming::rtc::peer::RtcDataChannelConfig;
 use crate::api_xbox::streaming::rtc::protocol::ChannelIds;
-use crate::streaming::video::{STREAM_HEIGHT, STREAM_WIDTH};
+use crate::streaming::video::{MAX_VIDEO_BITRATE_KBPS, REQUEST_HEIGHT, REQUEST_WIDTH};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStage {
@@ -133,8 +133,8 @@ pub fn generate_message(path: &str, data: Value) -> Value {
 }
 
 pub fn startup_messages() -> Vec<Value> {
-    let width = STREAM_WIDTH;
-    let height = STREAM_HEIGHT;
+    let width = REQUEST_WIDTH;
+    let height = REQUEST_HEIGHT;
 
     vec![
         generate_message(
@@ -165,13 +165,13 @@ pub fn startup_messages() -> Vec<Value> {
                 "supportsFps": 30,
                 "maxWidth": width,
                 "maxHeight": height,
-                "maxBitrateKbps": 2000,
+                "maxBitrateKbps": MAX_VIDEO_BITRATE_KBPS,
                 "video": {
                     "width": width,
                     "height": height,
                     "maxWidth": width,
                     "maxHeight": height,
-                    "maxBitrateKbps": 2000,
+                    "maxBitrateKbps": MAX_VIDEO_BITRATE_KBPS,
                 },
             }),
         ),
