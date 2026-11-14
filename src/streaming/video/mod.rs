@@ -8,12 +8,6 @@ pub const STREAM_HEIGHT: u32 = 720;
 pub const HW_OUTPUT_WIDTH: u32 = 960;
 pub const HW_OUTPUT_HEIGHT: u32 = 544;
 
-// Asked of the server: the Vita's own size (16:9) and a lighter stream. The decoder above still takes up to
-// STREAM_WIDTH x STREAM_HEIGHT, so a server that keeps sending 720p is decoded as before.
-pub const REQUEST_WIDTH: u32 = 960;
-pub const REQUEST_HEIGHT: u32 = 540;
-pub const MAX_VIDEO_BITRATE_KBPS: u32 = 1300;
-
 pub use memory::reserve_decoder_cdram;
 pub use metrics::video_performance_summary;
 pub use worker::VideoDecodeWorker;

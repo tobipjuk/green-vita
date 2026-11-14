@@ -3,7 +3,7 @@ use crate::streaming::video::{DecodedFrame, DecoderConfig, DirectVideoOutput, Vi
 use anyhow::Result;
 use bytes::Bytes;
 use rtc::media_stream::MediaStreamTrackId;
-use rtc::peer_connection::RTCPeerConnection;
+use crate::api::streaming::rtc::peer::RTCPeerConnection;
 use rtc::rtp::Packet;
 use rtc::rtp_transceiver::RTCRtpReceiverId;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ const STREAM_STATS_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Default)]
 struct VideoStats {
     dropped: u64,
+    recovered: u64,
     decode_errors: u64,
     last_sample_duration_us: Option<u64>,
     encoded_resolution: Option<(u32, u32)>,
@@ -73,6 +74,10 @@ impl VideoReceiver {
             .stats
             .dropped
             .saturating_add(sample_stats.dropped as u64);
+        self.stats.recovered = self
+            .stats
+            .recovered
+            .saturating_add(sample_stats.recovered as u64);
         if sample_stats.source_frame_duration_us.is_some() {
             self.stats.last_sample_duration_us = sample_stats.source_frame_duration_us;
         }
@@ -142,9 +147,10 @@ impl VideoReceiver {
             .map(|(width, height)| format!("{width}x{height}"))
             .unwrap_or_else(|| "?".to_owned());
         Some(format!(
-            "enc:{encoded_resolution} srcfps:{source_fps} {performance} wait:{} drop:{} err:{}",
+            "enc:{encoded_resolution} srcfps:{source_fps} {performance} wait:{} drop:{} rec:{} err:{}",
             u8::from(self.rtp.waiting_for_keyframe()),
             self.stats.dropped,
+            self.stats.recovered,
             self.stats.decode_errors,
         ))
     }

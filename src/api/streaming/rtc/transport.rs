@@ -1,7 +1,7 @@
 use super::ice;
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use rtc::peer_connection::RTCPeerConnection;
+use crate::api::streaming::rtc::peer::RTCPeerConnection;
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::net::SocketAddr;

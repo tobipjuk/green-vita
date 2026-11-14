@@ -8,7 +8,7 @@ use crate::streaming::video::{
     DecoderConfig, HW_OUTPUT_HEIGHT, HW_OUTPUT_WIDTH, STREAM_HEIGHT, STREAM_WIDTH,
 };
 use anyhow::Result;
-use rtc::peer_connection::RTCPeerConnection;
+use crate::api::streaming::rtc::peer::RTCPeerConnection;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 
 struct XboxRtcWorkerProvider {

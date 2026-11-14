@@ -111,8 +111,6 @@ impl Stream {
     }
 
     pub async fn send_sdp_offer(&self, sdp: &str) -> Result<String> {
-        // The bitrate cap the xCloud web player uses: b=AS on the video section of the offer.
-        let sdp = limit_video_bitrate(sdp, crate::streaming::video::MAX_VIDEO_BITRATE_KBPS);
         let body = json!({
             "messageType": "offer",
             "sdp": sdp,
@@ -394,46 +392,5 @@ mod tests {
             "candidate:2 1 UDP 1 203.0.113.10 9002 typ host"
         );
         assert_eq!(extract_remote_candidates(&wrapper_response).len(), 1);
-    }
-}
-
-/// Sets `b=AS:<kbps>` for the first `m=video` section (after its `i=`/`c=` lines, replacing a `b=` line there), as
-/// the xCloud web player does to cap the video bitrate. An SDP without a video section is returned unchanged.
-pub fn limit_video_bitrate(sdp: &str, kbps: u32) -> String {
-    let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut lines: Vec<String> = sdp.split(eol).map(str::to_owned).collect();
-    let Some(m) = lines.iter().position(|l| l.starts_with("m=video")) else {
-        return sdp.to_owned();
-    };
-    let mut at = m + 1;
-    while at < lines.len() && (lines[at].starts_with("i=") || lines[at].starts_with("c=")) {
-        at += 1;
-    }
-    let cap = format!("b=AS:{kbps}");
-    if at < lines.len() && lines[at].starts_with("b=") {
-        lines[at] = cap;
-    } else {
-        lines.insert(at, cap);
-    }
-    lines.join(eol)
-}
-
-#[cfg(test)]
-mod bitrate_tests {
-    use super::limit_video_bitrate;
-
-    #[test]
-    fn inserts_after_c_line_of_video_only() {
-        let sdp = "v=0\r\nm=audio 9 UDP 111\r\nc=IN IP4 0.0.0.0\r\nm=video 9 UDP 96\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\n";
-        assert_eq!(
-            limit_video_bitrate(sdp, 1300),
-            "v=0\r\nm=audio 9 UDP 111\r\nc=IN IP4 0.0.0.0\r\nm=video 9 UDP 96\r\nc=IN IP4 0.0.0.0\r\nb=AS:1300\r\na=mid:1\r\n"
-        );
-    }
-
-    #[test]
-    fn replaces_existing_b_line_and_keeps_sdp_without_video() {
-        assert_eq!(limit_video_bitrate("m=video 9\nb=AS:9000\na=x\n", 1300), "m=video 9\nb=AS:1300\na=x\n");
-        assert_eq!(limit_video_bitrate("v=0\nm=audio 9\n", 1300), "v=0\nm=audio 9\n");
     }
 }

@@ -45,8 +45,8 @@ jobs:
             exit 1
           fi
 
-          # "-lite": this fork's lighter-stream build, never mistaken for a stock release (title id unchanged)
-          echo "version=v$version-lite" >> "$GITHUB_OUTPUT"
+          # "-nack": this fork's NACK + receiver-report + frame-hold build (#282), never mistaken for a stock release (title id unchanged)
+          echo "version=v$version-nack" >> "$GITHUB_OUTPUT"
 
       - name: Check whether release exists
         if: github.event_name != 'workflow_dispatch'

@@ -9,8 +9,9 @@ use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::codec::opus::OpusPacket;
 use rtc::rtp::packetizer::Depacketizer;
 use rtc_media::io::sample_builder::SampleBuilder;
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MAX_PENDING_AUDIO_PACKETS: usize = 32;
 const MAX_H264_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
@@ -18,12 +19,44 @@ const VIDEO_RTP_CLOCK_RATE: u32 = 90_000;
 const AUDIO_MAX_LATE_PACKETS: u16 = 32;
 const LOW_FPS_DAMAGE_LIMIT: u8 = 8;
 const HIGH_FPS_DAMAGE_LIMIT: u8 = 3;
+/// An incomplete video frame is kept for a while once packets of a newer frame arrive, measured
+/// from its first packet, so a NACK retransmission or a reordered packet can still complete it.
+/// Before this hold the frame was dropped (and a keyframe requested) the moment a newer frame
+/// started. The hold is adaptive: while no retransmission has been seen it is about one frame
+/// interval, so a loss the sender never repairs freezes for roughly as long as before and the
+/// keyframe request is delayed by at most that; once retransmissions do arrive (`recovered`
+/// within `RECOVERY_WINDOW`) it grows to cover NACK interval + RTT + jitter.
+const SHORT_FRAME_HOLD: Duration = Duration::from_millis(20);
+const LONG_FRAME_HOLD: Duration = Duration::from_millis(80);
+/// A recovery keeps the long hold on for this long; without another one it falls back.
+const RECOVERY_WINDOW: Duration = Duration::from_secs(2);
+/// On the short hold, every N-th drop makes the next damaged frame probe with the long hold, so
+/// retransmissions slower than the short hold still get a chance to show up and switch the mode.
+const LONG_HOLD_PROBE_EVERY: u32 = 8;
+/// Most distinct newer frames parked during one hold. Their replay is a burst of decoder
+/// submissions; the decode queue holds 2-6 access units (video/worker.rs), so with the frame
+/// that completes this stays below the limit while the queue is near empty, as it normally is.
+const MAX_DEFERRED_FRAMES: usize = 3;
+/// Upper bound on parked packets (~0.4 MB at MTU-sized RTP payloads; 80 ms of a 2 Mbps stream
+/// is ~20 packets, a parked keyframe up to ~80).
+const MAX_DEFERRED_PACKETS: usize = 256;
 
 #[derive(Default)]
 pub(super) struct VideoSampleStats {
     pub dropped: u32,
+    /// Frames completed after a newer frame had already started: finished by a retransmitted or
+    /// reordered packet, which before the hold would have been counted in `dropped`.
+    pub recovered: u32,
     pub source_frame_duration_us: Option<u64>,
     pub encoded_resolution: Option<(u32, u32)>,
+}
+
+/// What `VideoRtp::receive_one` asks of the packet loop after handling one packet.
+enum Step {
+    Done,
+    /// The pending slot was emptied for the frame with this RTP timestamp; parked packets of
+    /// newer frames must now be replayed, oldest frame first.
+    Replay { base: u32 },
 }
 
 pub(super) struct AudioRtp {
@@ -64,6 +97,22 @@ pub(super) struct VideoRtp {
     damage_score: u8,
     stream_too_large: bool,
     waiting_for_keyframe: bool,
+    /// Packets of frames newer than `pending`, parked with their arrival time while the
+    /// incomplete `pending` frame is held (see `SHORT_FRAME_HOLD`/`LONG_FRAME_HOLD`).
+    deferred: Vec<(Instant, Packet)>,
+    /// Distinct RTP timestamps in `deferred`.
+    deferred_frames: usize,
+    /// The next completed frame follows a drop and must not erase its damage point.
+    frame_after_damage: bool,
+    /// When a held frame was last completed late (a retransmission or reordered packet arrived).
+    last_recovery_at: Option<Instant>,
+    /// Drops on the short hold since the last long-hold probe.
+    drops_since_probe: u32,
+    /// The next held frame uses the long hold as a probe.
+    probe_long_hold: bool,
+    /// Timestamp of the last dropped frame: its late packets must not reopen a frame that can
+    /// never complete. Cleared when a newer frame completes.
+    discard_before: Option<u32>,
 }
 
 struct PendingVideoFrame {
@@ -79,10 +128,10 @@ enum FrameAssembly {
 }
 
 impl PendingVideoFrame {
-    fn new(packet: Packet) -> Self {
+    fn new(packet: Packet, arrived_at: Instant) -> Self {
         Self {
             timestamp: packet.header.timestamp,
-            first_packet_at: Instant::now(),
+            first_packet_at: arrived_at,
             packets: vec![packet],
         }
     }
@@ -162,6 +211,13 @@ impl VideoRtp {
             damage_score: 0,
             stream_too_large: false,
             waiting_for_keyframe: false,
+            deferred: Vec::new(),
+            deferred_frames: 0,
+            frame_after_damage: false,
+            last_recovery_at: None,
+            drops_since_probe: 0,
+            probe_long_hold: false,
+            discard_before: None,
         }
     }
 
@@ -180,12 +236,111 @@ impl VideoRtp {
         keyframe_requested: &mut bool,
     ) -> VideoSampleStats {
         let mut stats = VideoSampleStats::default();
-        let mut frame_was_damaged = false;
+        let mut queue = VecDeque::new();
+        queue.push_back((Instant::now(), packet));
+        while let Some((arrived_at, packet)) = queue.pop_front() {
+            if let Step::Replay { base } =
+                self.receive_one(worker, arrived_at, packet, keyframe_requested, &mut stats)
+            {
+                // The pending slot is free again: parked packets of newer frames go first, oldest
+                // frame first (every parked frame is newer than `base`, so the distance sorts).
+                let mut deferred = std::mem::take(&mut self.deferred);
+                self.deferred_frames = 0;
+                deferred.sort_by_key(|(_, parked)| parked.header.timestamp.wrapping_sub(base));
+                for parked in deferred.into_iter().rev() {
+                    queue.push_front(parked);
+                }
+            }
+        }
+        stats
+    }
+
+    /// Whether a packet with this timestamp may be parked without exceeding the frame and packet
+    /// caps (a frame already parked may always grow).
+    fn can_defer(&self, timestamp: u32) -> bool {
+        self.deferred.len() < MAX_DEFERRED_PACKETS
+            && (self.deferred_frames < MAX_DEFERRED_FRAMES
+                || self
+                    .deferred
+                    .iter()
+                    .any(|(_, parked)| parked.header.timestamp == timestamp))
+    }
+
+    /// Parks a packet of a newer frame while an incomplete older frame is held. Deduplicated by
+    /// sequence number, so a retransmission that arrives twice costs nothing.
+    fn defer(&mut self, arrived_at: Instant, packet: Packet) {
+        if self
+            .deferred
+            .iter()
+            .any(|(_, parked)| parked.header.sequence_number == packet.header.sequence_number)
+        {
+            return;
+        }
+        if !self
+            .deferred
+            .iter()
+            .any(|(_, parked)| parked.header.timestamp == packet.header.timestamp)
+        {
+            self.deferred_frames += 1;
+        }
+        self.deferred.push((arrived_at, packet));
+    }
+
+    /// The hold for the pending frame: long once retransmissions have been seen recently or as a
+    /// probe, short otherwise.
+    fn frame_hold(&self, now: Instant) -> Duration {
+        let recovering = self
+            .last_recovery_at
+            .is_some_and(|at| now.duration_since(at) < RECOVERY_WINDOW);
+        if recovering || self.probe_long_hold {
+            LONG_FRAME_HOLD
+        } else {
+            SHORT_FRAME_HOLD
+        }
+    }
+
+    /// Bookkeeping for a dropped frame: its late packets are ignored from now on, and on the
+    /// short hold every `LONG_HOLD_PROBE_EVERY`-th drop arms a long-hold probe.
+    fn note_drop(&mut self, timestamp: u32, now: Instant) {
+        self.discard_before = Some(timestamp);
+        self.frame_after_damage = true;
+        let recovering = self
+            .last_recovery_at
+            .is_some_and(|at| now.duration_since(at) < RECOVERY_WINDOW);
+        if self.probe_long_hold || recovering {
+            self.probe_long_hold = false;
+            self.drops_since_probe = 0;
+        } else {
+            self.drops_since_probe += 1;
+            if self.drops_since_probe >= LONG_HOLD_PROBE_EVERY {
+                self.drops_since_probe = 0;
+                self.probe_long_hold = true;
+            }
+        }
+    }
+
+    /// What follows once the pending slot has been emptied for the frame with timestamp `base`.
+    fn after_frame(&self, base: u32) -> Step {
+        if self.deferred.is_empty() {
+            Step::Done
+        } else {
+            Step::Replay { base }
+        }
+    }
+
+    fn receive_one(
+        &mut self,
+        worker: &VideoDecodeWorker,
+        arrived_at: Instant,
+        packet: Packet,
+        keyframe_requested: &mut bool,
+        stats: &mut VideoSampleStats,
+    ) -> Step {
         if packet.payload.is_empty() {
             if self.next_sequence == Some(packet.header.sequence_number) {
                 self.next_sequence = Some(packet.header.sequence_number.wrapping_add(1));
             }
-            return stats;
+            return Step::Done;
         }
 
         let packet_timestamp = packet.header.timestamp;
@@ -193,7 +348,16 @@ impl VideoRtp {
             && pending.timestamp != packet_timestamp
         {
             if !timestamp_is_newer(packet_timestamp, pending.timestamp) {
-                return stats;
+                return Step::Done;
+            }
+            // A newer frame has started while this one is incomplete. Hold the incomplete frame
+            // for a short while so a NACK retransmission or a reordered packet can still finish
+            // it; the newer frame's packets wait in `deferred` meanwhile.
+            if arrived_at.duration_since(pending.first_packet_at) < self.frame_hold(arrived_at)
+                && self.can_defer(packet_timestamp)
+            {
+                self.defer(arrived_at, packet);
+                return Step::Done;
             }
             if let Some(incomplete) = self.pending.take() {
                 self.next_sequence = incomplete
@@ -202,18 +366,27 @@ impl VideoRtp {
                 self.depacketizer = H264Packet::default();
                 *keyframe_requested = true;
                 self.record_damage(worker);
-                frame_was_damaged = true;
+                self.note_drop(incomplete.timestamp, arrived_at);
                 stats.dropped = stats.dropped.saturating_add(1);
+                // The packet that ended the hold is replayed together with the parked ones, in
+                // frame order.
+                self.defer(arrived_at, packet);
+                return Step::Replay {
+                    base: incomplete.timestamp,
+                };
             }
         }
         if self.pending.is_none() {
             if self
                 .last_frame_timestamp
                 .is_some_and(|last| !timestamp_is_newer(packet_timestamp, last))
+                || self
+                    .discard_before
+                    .is_some_and(|dropped| !timestamp_is_newer(packet_timestamp, dropped))
             {
-                return stats;
+                return Step::Done;
             }
-            self.pending = Some(PendingVideoFrame::new(packet));
+            self.pending = Some(PendingVideoFrame::new(packet, arrived_at));
         } else if let Some(pending) = &mut self.pending {
             pending.insert(packet);
         }
@@ -223,17 +396,18 @@ impl VideoRtp {
             .as_ref()
             .map(|pending| pending.assemble(&mut self.depacketizer, self.next_sequence));
         let Some(assembly) = assembly else {
-            return stats;
+            return Step::Done;
         };
         let (data, marker_sequence) = match assembly {
-            FrameAssembly::Pending => return stats,
+            FrameAssembly::Pending => return Step::Done,
             FrameAssembly::Invalid => {
                 self.pending = None;
                 self.next_sequence = None;
                 *keyframe_requested = true;
                 self.record_damage(worker);
+                self.note_drop(packet_timestamp, arrived_at);
                 stats.dropped = stats.dropped.saturating_add(1);
-                return stats;
+                return self.after_frame(packet_timestamp);
             }
             FrameAssembly::Complete {
                 data,
@@ -241,6 +415,16 @@ impl VideoRtp {
             } => (data, marker_sequence),
         };
         let completed = self.pending.take().expect("assembled pending video frame");
+        let base = completed.timestamp;
+        // A frame that completes after packets of a newer frame arrived was finished by a
+        // retransmitted or reordered packet: before the hold it would have been dropped. It also
+        // proves retransmissions reach us, which switches the hold to the long one for a while.
+        if !self.deferred.is_empty() {
+            stats.recovered = stats.recovered.saturating_add(1);
+            self.last_recovery_at = Some(arrived_at);
+            self.drops_since_probe = 0;
+            self.probe_long_hold = false;
+        }
         // Record both average and worst-case RTP assembly time for the stream HUD.
         let assembly_us = completed.first_packet_at.elapsed().as_micros() as u64;
         crate::streaming::video::metrics::METRICS
@@ -265,6 +449,10 @@ impl VideoRtp {
             );
         }
         self.last_frame_timestamp = Some(completed.timestamp);
+        // A newer frame completed: the last drop's late packets are now rejected by
+        // `last_frame_timestamp` alone, so the marker can go (it must not outlive a timestamp
+        // wrap or a sender timestamp jump, which would otherwise freeze the video).
+        self.discard_before = None;
 
         let unit = inspect_h264_access_unit(&data);
         stats.encoded_resolution = unit.resolution;
@@ -285,14 +473,14 @@ impl VideoRtp {
             }
             self.waiting_for_keyframe = true;
             stats.dropped = stats.dropped.saturating_add(1);
-            return stats;
+            return self.after_frame(base);
         }
         if self.stream_too_large {
             if unit.resolution.is_none() || !unit.has_idr {
                 *keyframe_requested = true;
                 self.waiting_for_keyframe = true;
                 stats.dropped = stats.dropped.saturating_add(1);
-                return stats;
+                return self.after_frame(base);
             }
             self.stream_too_large = false;
         }
@@ -301,20 +489,21 @@ impl VideoRtp {
             if !unit.has_idr {
                 *keyframe_requested = true;
                 stats.dropped = stats.dropped.saturating_add(1);
-                return stats;
+                return self.after_frame(base);
             }
             self.waiting_for_keyframe = false;
             self.damage_score = 0;
-        } else if !frame_was_damaged {
+        } else if !self.frame_after_damage {
             self.damage_score = self.damage_score.saturating_sub(1);
         }
+        self.frame_after_damage = false;
 
         if !worker.submit_access_unit(data.to_vec(), self.source_frame_duration_us) {
             eprintln!("Video decoder queue is full; continuing while requesting a keyframe");
             *keyframe_requested = true;
             stats.dropped = stats.dropped.saturating_add(1);
         }
-        stats
+        self.after_frame(base)
     }
 
     fn record_damage(&mut self, worker: &VideoDecodeWorker) {
